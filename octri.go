@@ -282,12 +282,13 @@ func CaptureSpan(s Span) {
 		return
 	}
 	payload := map[string]any{
-		"traceId":   s.TraceID,
-		"spanId":    s.SpanID,
-		"name":      s.Name,
-		"service":   defStr(s.Service, "server"),
-		"startTime": s.StartTime.UTC().Format(time.RFC3339Nano),
-		"status":    defStr(s.Status, "ok"),
+		"traceId":     s.TraceID,
+		"spanId":      s.SpanID,
+		"environment": config.Environment,
+		"name":        s.Name,
+		"service":     defStr(s.Service, "server"),
+		"startTime":   s.StartTime.UTC().Format(time.RFC3339Nano),
+		"status":      defStr(s.Status, "ok"),
 	}
 	if s.ParentSpanID != "" {
 		payload["parentSpanId"] = s.ParentSpanID
