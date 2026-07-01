@@ -39,14 +39,31 @@ if err != nil {
 
 ## Sub-spans (where time goes)
 
+Go can't monkey-patch, so outbound HTTP is instrumented by wrapping your client's
+transport (once), and other work with a small helper:
+
+```go
+// Every request made with this client (using the handler's context) is an http span:
+client := &http.Client{Transport: octri.WrapTransport(http.DefaultTransport)}
+resp, err := client.Do(req.WithContext(ctx))
+
+// Time any work as a sub-span:
+err := octri.WithSpan(ctx, "orders.list", func(ctx context.Context) error {
+    return db.QueryContext(ctx, sql)
+}, octri.Op("db"))
+```
+
+Or manage a span directly:
+
 ```go
 ctx, span := octri.StartSpan(r.Context(), "orders.list", octri.Op("db"))
 rows, err := db.QueryContext(ctx, sql)
 if err != nil {
     span.Fail()
 }
-span.End()
+span.Finish()
 ```
 
-Pass the returned `ctx` down so nested `StartSpan` calls nest correctly; `op`
-("db", "cache", "http", …) color-codes the waterfall.
+Pass the returned `ctx` down so nested spans nest correctly; `op` ("db", "cache",
+"http", …) color-codes the waterfall. Requests to the monitoring backend are
+never traced (no feedback loop).

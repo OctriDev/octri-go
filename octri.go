@@ -318,11 +318,11 @@ type ActiveSpan struct {
 }
 
 // StartSpan opens a sub-span under the active request span and returns a child
-// context so nested StartSpan calls nest correctly. End() reports it. Outside a
-// request (no active span) it returns the context unchanged and a no-op span.
+// context so nested StartSpan calls nest correctly. Finish() reports it. Outside
+// a request (no active span) it returns the context unchanged and a no-op span.
 //
 //	ctx, span := octri.StartSpan(ctx, "orders.list", octri.Op("db"))
-//	defer span.End()
+//	defer span.Finish()
 func StartSpan(ctx context.Context, name string, opts ...SpanOption) (context.Context, *ActiveSpan) {
 	o := spanOptions{}
 	for _, opt := range opts {
@@ -345,15 +345,15 @@ func StartSpan(ctx context.Context, name string, opts ...SpanOption) (context.Co
 	return withSpanContext(ctx, spanContext{traceID: sc.traceID, spanID: spanID}), as
 }
 
-// Fail marks the span as errored (reported when End is called).
+// Fail marks the span as errored (reported when Finish is called).
 func (s *ActiveSpan) Fail() {
 	if s != nil {
 		s.span.Status = "error"
 	}
 }
 
-// End closes the span and reports it. Safe to call once; further calls are no-ops.
-func (s *ActiveSpan) End() {
+// Finish closes the span and reports it. Safe to call once; further calls are no-ops.
+func (s *ActiveSpan) Finish() {
 	if s == nil || s.ended {
 		return
 	}
