@@ -26,7 +26,7 @@ import (
 // Config holds the reporter settings. Call Init once at startup.
 type Config struct {
 	URL         string // Monitoring base URL, e.g. https://monitoring.example.com
-	Token       string // Ingest token for your project
+	Token       string // Project ingest token; empty only for open self-hosted ingestion
 	Environment string // Project environment / id (the dashboard project id)
 	Release     string // Optional release identifier
 }
@@ -67,7 +67,9 @@ var traceparentRe = regexp.MustCompile(`(?i)^00-([0-9a-f]{32})-([0-9a-f]{16})-[0
 // TraceFromHeader reads the trace from a `traceparent` header, or starts a fresh one.
 func TraceFromHeader(traceparent string) Trace {
 	if m := traceparentRe.FindStringSubmatch(strings.TrimSpace(traceparent)); m != nil {
-		return Trace{TraceID: m[1], ParentSpanID: m[2]}
+		if !allZeros(m[1]) && !allZeros(m[2]) {
+			return Trace{TraceID: strings.ToLower(m[1]), ParentSpanID: strings.ToLower(m[2])}
+		}
 	}
 	return Trace{TraceID: randomHex(16)}
 }
@@ -92,6 +94,11 @@ func currentSpan(ctx context.Context) (spanContext, bool) {
 // ── Frame source context ─────────────────────────────────────────────────────
 
 const contextLines = 5
+
+const (
+	requestTimeout          = 5 * time.Second
+	maxIdempotencyKeyLength = 256
+)
 
 var sourceCache sync.Map // file -> []string (nil = unreadable)
 
@@ -172,28 +179,164 @@ func buildFrames(skip int) []frame {
 
 // ── Reporting ────────────────────────────────────────────────────────────────
 
-var httpClient = &http.Client{Timeout: 5 * time.Second}
+var httpClient = &http.Client{Timeout: requestTimeout}
 
-func send(path string, payload any) {
+func safeHeaderValue(value string) bool {
+	return value != "" && !strings.ContainsAny(value, "\r\n")
+}
+
+func safeIdempotencyKey(value string) bool {
+	return safeHeaderValue(value) && len(value) <= maxIdempotencyKeyLength
+}
+
+func safeEventID(value string) string {
+	candidate := strings.TrimSpace(value)
+	if safeIdempotencyKey(candidate) {
+		return candidate
+	}
+	return randomHex(16)
+}
+
+func allZeros(value string) bool {
+	return value != "" && strings.Trim(value, "0") == ""
+}
+
+func suppressMonitoringPanic() {
+	_ = recover()
+}
+
+func marshalPayload(payload any) (body []byte, err error) {
+	defer func() {
+		if recover() != nil {
+			body = nil
+			err = fmt.Errorf("payload serialization failed")
+		}
+	}()
+	return json.Marshal(payload)
+}
+
+func send(path string, payload any, idempotencyKey string) {
 	cfg := config
 	if cfg == nil {
 		return
 	}
-	body, err := json.Marshal(payload)
+	if !safeIdempotencyKey(idempotencyKey) ||
+		(cfg.Token != "" && !safeHeaderValue(cfg.Token)) {
+		return
+	}
+	body, err := marshalPayload(payload)
 	if err != nil {
 		return
 	}
+	client := httpClient
 	go func() {
+		defer func() {
+			_ = recover() // A transport panic must never take down the application.
+		}()
 		req, err := http.NewRequest(http.MethodPost, cfg.URL+path, bytes.NewReader(body))
 		if err != nil {
 			return
 		}
 		req.Header.Set("content-type", "application/json")
-		req.Header.Set("authorization", "Bearer "+cfg.Token)
-		if resp, err := httpClient.Do(req); err == nil {
+		req.Header.Set("idempotency-key", idempotencyKey)
+		if cfg.Token != "" {
+			req.Header.Set("authorization", "Bearer "+cfg.Token)
+		}
+		if resp, err := client.Do(req); err == nil {
 			_ = resp.Body.Close()
 		}
 	}()
+}
+
+// EventOptions enriches a standalone application event. A generated Octri API
+// SDK is not required. EventID may be supplied to make retries idempotent.
+type EventOptions struct {
+	Timestamp   time.Time
+	Level       string
+	OperationID string
+	Method      string
+	Path        string
+	StatusCode  int
+	LatencyMS   float64
+	Attempt     int
+	RequestID   string
+	User        map[string]any
+	Tags        map[string]any
+	Context     map[string]any
+	Breadcrumbs []map[string]any
+	Fingerprint string
+	TraceID     string
+	SpanID      string
+	EventID     string
+}
+
+// CaptureEvent logs an application event directly to Octri. Delivery is
+// fire-and-forget and best-effort so monitoring cannot affect the application.
+func CaptureEvent(message string, o EventOptions) {
+	defer suppressMonitoringPanic()
+	if config == nil {
+		return
+	}
+	timestamp := o.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	tags := map[string]any{"octri.origin": "standalone"}
+	for key, value := range o.Tags {
+		tags[key] = value
+	}
+	eventID := safeEventID(o.EventID)
+	payload := map[string]any{
+		"eventId":     eventID,
+		"timestamp":   timestamp.UTC().Format(time.RFC3339Nano),
+		"level":       defStr(o.Level, "info"),
+		"message":     message,
+		"environment": config.Environment,
+		"tags":        tags,
+	}
+	if config.Release != "" {
+		payload["release"] = config.Release
+	}
+	if o.OperationID != "" {
+		payload["operationId"] = o.OperationID
+	}
+	if o.Method != "" {
+		payload["method"] = o.Method
+	}
+	if o.Path != "" {
+		payload["path"] = o.Path
+	}
+	if o.StatusCode != 0 {
+		payload["statusCode"] = o.StatusCode
+	}
+	if o.LatencyMS != 0 {
+		payload["latencyMs"] = o.LatencyMS
+	}
+	if o.Attempt != 0 {
+		payload["attempt"] = o.Attempt
+	}
+	if o.RequestID != "" {
+		payload["requestId"] = o.RequestID
+	}
+	if o.User != nil {
+		payload["user"] = o.User
+	}
+	if o.Context != nil {
+		payload["context"] = o.Context
+	}
+	if o.Breadcrumbs != nil {
+		payload["breadcrumbs"] = o.Breadcrumbs
+	}
+	if o.Fingerprint != "" {
+		payload["fingerprint"] = o.Fingerprint
+	}
+	if o.TraceID != "" {
+		payload["traceId"] = o.TraceID
+	}
+	if o.SpanID != "" {
+		payload["spanId"] = o.SpanID
+	}
+	send("/ingest", payload, eventID)
 }
 
 type errorOptions struct {
@@ -221,6 +364,7 @@ func WithLevel(level string) ErrorOption {
 // CaptureError reports an error to the monitoring project (fire-and-forget),
 // tagged octri.origin=server and linked to the request's trace (from ctx).
 func CaptureError(ctx context.Context, err error, opts ...ErrorOption) {
+	defer suppressMonitoringPanic()
 	if config == nil || err == nil {
 		return
 	}
@@ -229,11 +373,14 @@ func CaptureError(ctx context.Context, err error, opts ...ErrorOption) {
 		opt(&o)
 	}
 	tr := Trace{TraceID: randomHex(16)}
-	if sc, ok := currentSpan(ctx); ok {
-		tr = Trace{TraceID: sc.traceID, ParentSpanID: sc.spanID}
+	if ctx != nil {
+		if sc, ok := currentSpan(ctx); ok {
+			tr = Trace{TraceID: sc.traceID, ParentSpanID: sc.spanID}
+		}
 	}
+	eventID := randomHex(16)
 	payload := map[string]any{
-		"eventId":     randomHex(8),
+		"eventId":     eventID,
 		"timestamp":   time.Now().UTC().Format(time.RFC3339Nano),
 		"level":       o.level,
 		"environment": config.Environment,
@@ -258,7 +405,7 @@ func CaptureError(ctx context.Context, err error, opts ...ErrorOption) {
 	if o.statusCode != 0 {
 		payload["statusCode"] = o.statusCode
 	}
-	send("/ingest", payload)
+	send("/ingest", payload, eventID)
 }
 
 // ── Spans (request waterfall) ────────────────────────────────────────────────
@@ -278,7 +425,16 @@ type Span struct {
 
 // CaptureSpan reports one span to the trace store (fire-and-forget).
 func CaptureSpan(s Span) {
+	defer suppressMonitoringPanic()
 	if config == nil {
+		return
+	}
+	if strings.TrimSpace(s.TraceID) == "" ||
+		strings.TrimSpace(s.SpanID) == "" ||
+		strings.TrimSpace(s.Name) == "" ||
+		s.StartTime.IsZero() ||
+		(len(s.TraceID) == 32 && allZeros(s.TraceID)) ||
+		(len(s.SpanID) == 16 && allZeros(s.SpanID)) {
 		return
 	}
 	payload := map[string]any{
@@ -299,7 +455,7 @@ func CaptureSpan(s Span) {
 	if s.OperationID != "" {
 		payload["operationId"] = s.OperationID
 	}
-	send("/traces", payload)
+	send("/traces", payload, s.TraceID+":"+s.SpanID)
 }
 
 type spanOptions struct{ op string }

@@ -23,6 +23,26 @@ octri.Init(octri.Config{
 http.ListenAndServe(":8080", octri.Middleware(mux))
 ```
 
+Hosted users can copy the project-scoped URL, token, and environment from the
+Monitoring connection settings (or its API). Leave `Token` empty only when
+pointing at an open self-hosted ingest endpoint. Every request carries an
+idempotency key.
+
+## Standalone events
+
+No generated API SDK is required to send your own events:
+
+```go
+octri.CaptureEvent("checkout.completed", octri.EventOptions{
+    User:    map[string]any{"id": customer.ID},
+    Tags:    map[string]any{"region": "eu-west", "plan": "growth"},
+    Context: map[string]any{"orderId": order.ID, "total": order.Total},
+})
+```
+
+Delivery is asynchronous and best-effort. Set `EventID` to make a retried
+delivery idempotent.
+
 ## Reporting an error
 
 Errors are values in Go, so report them where they happen — frames are captured
