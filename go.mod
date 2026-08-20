@@ -1,3 +1,3 @@
-module github.com/octri/octri-go
+module github.com/octridev/octri-go
 
 go 1.21

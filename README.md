@@ -11,7 +11,7 @@ The Go sibling of [`@octri/node`](../octri-node). Standard library only.
 ## Setup
 
 ```go
-import "github.com/octri/octri-go"
+import "github.com/octridev/octri-go"
 
 octri.Init(octri.Config{
     URL:         "https://monitoring.example.com",
