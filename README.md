@@ -4,7 +4,7 @@
 handlers with original-source context per stack frame, time every request and
 any sub-span you open into a waterfall, and join each server error to the client
 SDK error for the same request through the W3C `traceparent` header. In the
-dashboard you see the full client → server stack under one trace.
+dashboard you see the full client and server stack under one trace.
 
 Octri turns an OpenAPI spec into a documentation site, client SDKs for ten
 languages, an MCP server your AI assistant can call, and monitoring for the
@@ -58,7 +58,7 @@ delivery idempotent.
 
 ## Reporting an error
 
-Errors are values in Go, so report them where they happen — frames are captured
+Errors are values in Go, so report them where they happen. Frames are captured
 at the call site:
 
 ```go
@@ -98,7 +98,7 @@ span.Finish()
 ```
 
 Pass the returned `ctx` down so nested spans nest correctly; `op` ("db", "cache",
-"http", …) color-codes the waterfall. Requests to the monitoring backend are
+"http", and so on) color-codes the waterfall. Requests to the monitoring backend are
 never traced (no feedback loop).
 
 ---
@@ -114,19 +114,21 @@ never traced (no feedback loop).
 
 ### Monitoring runtimes
 
-[Node](https://github.com/octridev/octri-node) ·
-[Python](https://github.com/octridev/octri-python) ·
-[Go](https://github.com/octridev/octri-go) ·
-[Ruby](https://github.com/octridev/octri-ruby) ·
-[Rust](https://github.com/octridev/octri-rust) ·
-[PHP](https://github.com/octridev/octri-php) ·
-[Java](https://github.com/octridev/octri-java) ·
-[Kotlin](https://github.com/octridev/octri-kotlin) ·
-[Swift](https://github.com/octridev/octri-swift) ·
-[Dart](https://github.com/octridev/octri-dart)
+- [Node](https://github.com/octridev/octri-node)
+- [Python](https://github.com/octridev/octri-python)
+- [Go](https://github.com/octridev/octri-go)
+- [Ruby](https://github.com/octridev/octri-ruby)
+- [Rust](https://github.com/octridev/octri-rust)
+- [PHP](https://github.com/octridev/octri-php)
+- [Java](https://github.com/octridev/octri-java)
+- [Kotlin](https://github.com/octridev/octri-kotlin)
+- [Swift](https://github.com/octridev/octri-swift)
+- [Dart](https://github.com/octridev/octri-dart)
 
-[Documentation](https://docs.octri.dev/docs) ·
-[Pricing](https://octri.dev/pricing) ·
-[Changelog](https://docs.octri.dev/changelog)
+### More
+
+- [Documentation](https://docs.octri.dev/docs)
+- [Pricing](https://octri.dev/pricing)
+- [Changelog](https://docs.octri.dev/changelog)
 
 MIT licensed.
