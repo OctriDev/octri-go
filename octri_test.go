@@ -102,6 +102,22 @@ func TestEventIDsAreNonBlankSafeAndBounded(t *testing.T) {
 	}
 }
 
+func TestSourceContextIsLimitedToInAppFrames(t *testing.T) {
+	frames := buildFrames(1)
+	inApp := false
+	for _, fr := range frames {
+		if fr.InApp && fr.ContextLine != "" {
+			inApp = true
+		}
+		if !fr.InApp && (fr.ContextLine != "" || len(fr.PreContext) > 0) {
+			t.Fatalf("dependency frame carried source: %s", fr.Filename)
+		}
+	}
+	if !inApp {
+		t.Fatal("this test file is in-app, so its frame should carry source")
+	}
+}
+
 func TestUnsafeAuthAndInvalidSpansAreSuppressed(t *testing.T) {
 	originalClient := httpClient
 	originalConfig := config

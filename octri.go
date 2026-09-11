@@ -2,7 +2,7 @@
 //
 // Add it to your live API; it reports backend errors to your Octri monitoring
 // project (with original-source context per stack frame) and links each one to
-// the client SDK error for the same request via the W3C `traceparent` header —
+// the client SDK error for the same request via the W3C `traceparent` header,
 // so the dashboard shows the full client -> server stack under one trace. It
 // also times requests (and any sub-spans you open) into the request waterfall.
 package octri
@@ -54,6 +54,210 @@ func defStr(s, fallback string) string {
 	return s
 }
 
+// ── Scrubbing ────────────────────────────────────────────────────────────────
+
+// Keys whose value never leaves the process. Compared against the key with case
+// and separators removed, so `api_key`, `apiKey` and `API-KEY` all match
+// `apikey`, and the test is a substring one, so `stripeSecretKey` matches too.
+var scrubKeys = []string{
+	"password",
+	"passwd",
+	"passphrase",
+	"secret",
+	"token",
+	"apikey",
+	"authorization",
+	"credential",
+	"cookie",
+	"session",
+	"privatekey",
+	"accesskey",
+	"cardnumber",
+	"creditcard",
+	"cvv",
+	"ssn",
+}
+
+const (
+	redacted  = "[redacted]"
+	truncated = "[truncated]"
+	// Deep enough for real context objects, shallow enough to stay cheap.
+	maxScrubDepth = 8
+)
+
+var (
+	bearerRe   = regexp.MustCompile(`(?i)\bbearer\s+[\w.~+/-]+=*`)
+	jwtRe      = regexp.MustCompile(`\beyJ[\w-]+\.[\w-]+\.[\w-]+`)
+	digitRunRe = regexp.MustCompile(`\b(?:\d[ -]?){12,18}\d\b`)
+	emailRe    = regexp.MustCompile(`[\w.%+-]+@[\w-]+(?:\.[\w-]+)+`)
+	nonAlnumRe = regexp.MustCompile(`[^a-z0-9]`)
+)
+
+var (
+	extraScrubKeys []string
+	beforeSend     func(map[string]any) map[string]any
+)
+
+// AddScrubFields redacts more key names, on top of the built-in list. Matching
+// ignores case and separators and is a substring test, so "account" also covers
+// "accountNumber". Call it at startup, next to Init.
+func AddScrubFields(fields ...string) {
+	for _, field := range fields {
+		key := normalizeKey(field)
+		if key == "" {
+			continue
+		}
+		known := false
+		for _, existing := range extraScrubKeys {
+			if existing == key {
+				known = true
+				break
+			}
+		}
+		if !known {
+			extraScrubKeys = append(extraScrubKeys, key)
+		}
+	}
+}
+
+// SetBeforeSend runs a hook on every payload just before it is sent. Return the
+// payload (editing it in place is fine) to send it, or nil to drop the event:
+//
+//	octri.SetBeforeSend(func(payload map[string]any) map[string]any {
+//		if payload["path"] == "/health" {
+//			return nil
+//		}
+//		return payload
+//	})
+//
+// Redaction still runs afterwards, so a hook cannot leak a credential by
+// accident. Pass nil to remove the hook. Call it at startup, next to Init.
+func SetBeforeSend(hook func(map[string]any) map[string]any) {
+	beforeSend = hook
+}
+
+func normalizeKey(key string) string {
+	return nonAlnumRe.ReplaceAllString(strings.ToLower(key), "")
+}
+
+func isSecretKey(key string) bool {
+	normalized := normalizeKey(key)
+	if normalized == "" {
+		return false
+	}
+	for _, candidate := range scrubKeys {
+		if strings.Contains(normalized, candidate) {
+			return true
+		}
+	}
+	for _, candidate := range extraScrubKeys {
+		if strings.Contains(normalized, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// passesLuhn tells a card number from the order ids and timestamps that look
+// like one.
+func passesLuhn(digits string) bool {
+	sum := 0
+	double := false
+	for i := len(digits) - 1; i >= 0; i-- {
+		digit := int(digits[i] - '0')
+		if double {
+			digit *= 2
+			if digit > 9 {
+				digit -= 9
+			}
+		}
+		sum += digit
+		double = !double
+	}
+	return sum%10 == 0
+}
+
+// scrubText removes credentials and personal data that leaked into free text.
+func scrubText(value string) string {
+	if value == "" {
+		return value
+	}
+	value = bearerRe.ReplaceAllString(value, redacted)
+	value = jwtRe.ReplaceAllString(value, redacted)
+	value = digitRunRe.ReplaceAllStringFunc(value, func(run string) string {
+		digits := strings.Map(func(r rune) rune {
+			if r >= '0' && r <= '9' {
+				return r
+			}
+			return -1
+		}, run)
+		if passesLuhn(digits) {
+			return redacted
+		}
+		return run
+	})
+	return emailRe.ReplaceAllString(value, redacted)
+}
+
+// scrubValue redacts credential-shaped keys anywhere in the payload, and strips
+// secrets out of the free text around them. "user" is the field you deliberately
+// fill with an identity, so its strings are left alone; its keys are still
+// checked.
+func scrubValue(value any, depth int, text bool) any {
+	switch typed := value.(type) {
+	case string:
+		if text {
+			return scrubText(typed)
+		}
+		return typed
+	case []any:
+		if depth >= maxScrubDepth {
+			return truncated
+		}
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = scrubValue(item, depth+1, text)
+		}
+		return out
+	case map[string]any:
+		if depth >= maxScrubDepth {
+			return truncated
+		}
+		out := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			if isSecretKey(key) {
+				out[key] = redacted
+				continue
+			}
+			out[key] = scrubValue(nested, depth+1, text && key != "user")
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+// scrubPayload is the last thing every payload passes through. Both the hook and
+// the redaction live here rather than in the capture functions, so nothing can
+// be reported around them. It works on the marshalled body so that the hook
+// always sees the same generic shape the ingest API does.
+func scrubPayload(body []byte) ([]byte, bool) {
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil, false
+	}
+	if beforeSend != nil {
+		if decoded = beforeSend(decoded); decoded == nil {
+			return nil, false
+		}
+	}
+	scrubbed, err := marshalPayload(scrubValue(decoded, 0, true))
+	if err != nil {
+		return nil, false
+	}
+	return scrubbed, true
+}
+
 // ── Trace context (W3C) ──────────────────────────────────────────────────────
 
 // Trace identifies a distributed trace and the caller's span.
@@ -98,20 +302,34 @@ const contextLines = 5
 const (
 	requestTimeout          = 5 * time.Second
 	maxIdempotencyKeyLength = 256
+	maxSourceBytes          = 512 * 1024
+	maxCachedSources        = 256
 )
 
-var sourceCache sync.Map // file -> []string (nil = unreadable)
+var (
+	sourceMu    sync.Mutex
+	sourceCache = map[string][]string{} // file -> lines (nil = unreadable)
+)
 
+// readSource returns the file's lines, or nil when it is missing or too large.
+// A stack can name any number of files, so the cache is bounded too.
 func readSource(file string) []string {
-	if v, ok := sourceCache.Load(file); ok {
-		lines, _ := v.([]string)
+	sourceMu.Lock()
+	defer sourceMu.Unlock()
+	if lines, ok := sourceCache[file]; ok {
 		return lines
 	}
 	var lines []string
-	if data, err := os.ReadFile(file); err == nil {
-		lines = strings.Split(string(data), "\n")
+	// Big files are skipped, not truncated, so line numbers keep lining up.
+	if info, err := os.Stat(file); err == nil && info.Size() <= maxSourceBytes {
+		if data, err := os.ReadFile(file); err == nil {
+			lines = strings.Split(string(data), "\n")
+		}
 	}
-	sourceCache.Store(file, lines)
+	if len(sourceCache) >= maxCachedSources {
+		sourceCache = map[string][]string{}
+	}
+	sourceCache[file] = lines
 	return lines
 }
 
@@ -162,7 +380,12 @@ func buildFrames(skip int) []frame {
 				Lineno:   f.Line,
 				InApp:    !strings.HasPrefix(f.File, goroot) && !strings.Contains(f.File, "/go/pkg/mod/"),
 			}
-			if lines := readSource(f.File); lines != nil && f.Line >= 1 && f.Line <= len(lines) {
+			// Only your own files: the dashboard shows them, stdlib source is noise.
+			lines := []string(nil)
+			if fr.InApp {
+				lines = readSource(f.File)
+			}
+			if lines != nil && f.Line >= 1 && f.Line <= len(lines) {
 				idx := f.Line - 1
 				fr.ContextLine = lines[idx]
 				fr.PreContext = clip(lines, idx-contextLines, idx)
@@ -226,6 +449,10 @@ func send(path string, payload any, idempotencyKey string) {
 	}
 	body, err := marshalPayload(payload)
 	if err != nil {
+		return
+	}
+	body, ok := scrubPayload(body)
+	if !ok {
 		return
 	}
 	client := httpClient
