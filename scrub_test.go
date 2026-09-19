@@ -147,20 +147,43 @@ func TestErrorMessagesAreScrubbed(t *testing.T) {
 	}
 }
 
-func TestUserIdentitySurvivesButUserCredentialsDoNot(t *testing.T) {
+// The identity the dashboard keys on is "id", which survives. Direct
+// identifiers under the user are redacted like they are in every generated SDK.
+func TestUserIDSurvivesButUserCredentialsAndIdentifiersDoNot(t *testing.T) {
 	next := scrubServer(t)
 	CaptureEvent("profile update failed", EventOptions{User: map[string]any{
-		"id":           "u_1",
-		"email":        "ada@example.com",
-		"sessionToken": "st_1",
+		"id":            "u_1",
+		"email":         "ada@example.com",
+		"sessionToken":  "st_1",
+		"customerPhone": "+1 555 0100",
 	}})
 
 	user, _ := next()["user"].(map[string]any)
-	if user["email"] != "ada@example.com" || user["id"] != "u_1" {
-		t.Fatalf("user identity was scrubbed: %#v", user)
+	if user["id"] != "u_1" {
+		t.Fatalf("user id was scrubbed: %#v", user)
 	}
-	if user["sessionToken"] != redacted {
-		t.Fatalf("sessionToken = %#v, want redacted", user["sessionToken"])
+	for _, key := range []string{"email", "sessionToken", "customerPhone"} {
+		if user[key] != redacted {
+			t.Fatalf("%s = %#v, want redacted", key, user[key])
+		}
+	}
+}
+
+func TestIdentifierWordsInsideLongerKeysAreRedacted(t *testing.T) {
+	next := scrubServer(t)
+	CaptureEvent("checkout failed", EventOptions{Context: map[string]any{
+		"billingAddress":      map[string]any{"line1": "1 High St"},
+		"shipping_first_name": "Ada",
+		"avatarUrl":           "https://cdn.example.com/a.png",
+		"queryTimeMs":         12,
+	}})
+
+	ctx, _ := next()["context"].(map[string]any)
+	if ctx["billingAddress"] != redacted || ctx["shipping_first_name"] != redacted {
+		t.Fatalf("identifier keys survived: %#v", ctx)
+	}
+	if ctx["avatarUrl"] != "https://cdn.example.com/a.png" || ctx["queryTimeMs"] != float64(12) {
+		t.Fatalf("innocent keys were scrubbed: %#v", ctx)
 	}
 }
 
